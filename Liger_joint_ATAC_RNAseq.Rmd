@@ -1,0 +1,249 @@
+---
+title: "PBMC_granulocyte_sc_ATAC_RNA_liger"
+author: "Devika Agarwal"
+date: 'Last update: `r date()`'
+output:
+  html_notebook:
+    theme: cerulean
+    number_sections: true
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: yes
+      toc_depth: 6
+---
+---
+<style type="text/css">
+
+body{ /* Normal  */
+      font-size: 12px;
+  }
+td {  /* Table  */
+  font-size: 10px;
+}
+h1.title {
+  font-size: 20px;
+  color: DarkRed;
+}
+h1 { /* Header 1 */
+  font-size: 20px;
+  color: DarkBlue;
+}
+h2 { /* Header 2 */
+    font-size: 18px;
+  color: DarkBlue;
+}
+h3 { /* Header 3 */
+  font-size: 14px;
+  font-family: "Times New Roman", Times, serif;
+  color: DarkBlue;
+}
+code.r{ /* Code block */
+    font-size: 12px;
+}
+pre { /* Code block - determines code spacing between lines */
+    font-size: 14px;
+}
+</style>
+```{r}
+library(rliger)
+library(tidyverse)
+library(patchwork)
+library(data.table)
+library(doMC)
+knitr::opts_chunk$set(cache=F,echo=T,message=FALSE,warning=FALSE, cache.lazy = FALSE)
+## white background theme for all
+theme_set(theme_bw())
+```
+
+ATAC-Seq analysis 
+
+We then import the bedmap outputs into the R Console or RStudio. Note that the as.is option in read.table is specified to prevent the conversion of character columns to factor columns:
+
+
+```{r}
+setwd("~/Documents/PBMC_atac_rna")
+genes.bc <- read.table(file = "hg38_atac_genes_bc.bed", sep = "\t", as.is = c(4,7), header = FALSE)
+promoters.bc <- read.table(file = "hg38_atac_promoters_bc.bed", sep = "\t", as.is = c(4,7), header = FALSE)
+```
+
+3. Cell barcodes are then splited and extracted from the outputs. We recommand the user to filter out those barcodes which have a total number of reads lower than a certain threshold, for example, 1000. This threshold can be adjusted according to the size and quality of the samples.
+
+
+
+```{r}
+bc <- genes.bc[,7]
+bc_split <- strsplit(bc,";")
+bc_split_vec <- unlist(bc_split)
+bc_unique <- unique(bc_split_vec)
+bc_counts <- table(bc_split_vec)
+bc_filt <- names(bc_counts)[bc_counts > 650]
+barcodes <- bc_filt
+```
+
+4. We can then use LIGER’s makeFeatureMatrix function to calculate accessibility counts for gene body and promoter individually. This function takes the output from bedmap and efficiently counts the number of fragments overlapping each gene and promoter. We could count the genes and promoters in a single step, but choose to calculate them separately in case it is necessary to look at gene or promoter accessibility individually in downstream analyses.
+
+
+
+```{r}
+
+gene.counts <- makeFeatureMatrix(genes.bc, barcodes)
+promoter.counts <- makeFeatureMatrix(promoters.bc, barcodes)
+```
+
+Next, these two count matrices need to be re-sorted by gene symbol. We then add the matrices together, yielding a single matrix of gene accessibility counts in each cell.
+
+
+```{r}
+gene.counts <- gene.counts[order(rownames(gene.counts)),]
+promoter.counts <- promoter.counts[order(rownames(promoter.counts)),]
+promoter.counts_fil <- as.data.frame(promoter.counts) %>% filter(rownames(.) %in% rownames(gene.counts)) %>% as.matrix()
+gene.counts_fil <- as.data.frame(gene.counts) %>% filter(rownames(.) %in% rownames(promoter.counts)) %>% as.matrix()
+
+
+pbmc_granulocyte_3k <- (gene.counts_fil + promoter.counts_fil)
+colnames(pbmc_granulocyte_3k) <- gsub("-1","", (colnames(pbmc_granulocyte_3k)))
+colnames(pbmc_granulocyte_3k)=paste0("atac_",colnames(pbmc_granulocyte_3k))
+```
+
+5. Once the gene-level scATAC-seq counts are generated, the read10X function from LIGER can be used to read scRNA-seq count matrices output by CellRanger. You can pass in a directory (or a list of directories) containing raw outputs (for example, “/Sample_1/outs/filtered_feature_bc_matrix”) to the parameter sample.dirs. Next, a vector of names to use for the sample (or samples, corresponding to sample.dirs) should be passed to parameter sample.names as well. LIGER can also use data from any other protocol, as long as it is provided in a genes x cells R matrix format.
+
+```{r}
+pbmc.3k_all <- read10X(sample.dirs = list("./filtered_feature_bc_matrix/"), sample.names = list("pbmc"), merge = T)
+
+```
+
+6. We can now create a LIGER object with the createLiger function. We also remove unneeded variables to conserve memory.
+
+```{r}
+pbmc.data <- list(atac = pbmc_granulocyte_3k, rna = pbmc.3k_all[["Gene Expression"]])
+int.pbmc <- createLiger(pbmc.data)
+```
+
+```{r}
+rm(genes.bc, promoters.bc, gene.counts, promoter.counts, pbmc_granulocyte_3k, pbmc.rna, pbmc.data)
+gc()
+```
+
+7. Preprocessing steps are needed before running iNMF. Each dataset is normalized to account for differences in total gene-level counts across cells using the normalize function. Next, highly variable genes from each dataset are identified and combined for use in downstream analysis. Note that by setting the parameter datasets.use to 2, genes will be selected only from the scRNA-seq dataset (the second dataset) by the selectGenes function. We recommend not using the ATAC-seq data for variable gene selection because the statistical properties of the ATAC-seq data are very different from scRNA-seq, violating the assumptions made by the statistical model we developed for selecting genes from RNA data. Finally, the scaleNotCenter function scales normalized datasets without centering by the mean, giving the nonnegative input data required by iNMF.
+
+
+
+```{r}
+int.pbmc <- normalize(int.pbmc)
+int.pbmc <- selectGenes(int.pbmc, datasets.use = 2, do.plot = T, var.thresh = 0.10)
+int.pbmc <- scaleNotCenter(int.pbmc)
+```
+Stage II: Joint Matrix Factorization (3 - 10 minutes)
+8. We next perform joint matrix factorization (iNMF) on the normalized and scaled RNA and ATAC data. This step calculates metagenes–sets of co-expressed genes that distinguish cell populations–containing both shared and dataset-specific signals. The cells are then represented in terms of the “expression level” of each metagene, providing a low-dimensional representation that can be used for joint clustering and visualization. To run iNMF on the scaled datasets, we use the optimizeALS function with proper hyperparameter settings.
+
+To run iNMF on the scaled datasets, use optimizeALS function with proper hyperparameters setting:
+Important parameters are as follows:
+
+k. Integer value specifying the inner dimension of factorization, or number of factors. Higher k is recommended for datasets with more substructure. We find that a value of k in the range 20 - 40 works well for most datasets. Because this is an unsupervised, exploratory analysis, there is no single “right” value for k, and in practice, users choose k from a combination of biological prior knowledge and other information.
+lambda. This is a regularization parameter. Larger values penalize dataset-specific effects more strongly, causing the datasets to be better aligned, but possibly at the cost of higher reconstruction error. The default value is 5. We recommend using this value for most analyses, but find that it can be lowered to 1 in cases where the dataset differences are expected to be relatively small, such as scRNA-seq data from the same tissue but different individuals.
+thresh. This sets the convergence threshold. Lower values cause the algorithm to run longer. The default is 1e-6.
+max.iters. This variable sets the maximum number of iterations to perform. The default value is 30.
+
+```{r}
+suggestK(int.pbmc,max.iters = 50,num.cores = 4,rand.seed = 9090,return.data = T)
+
+```
+
+```{r}
+int.pbmc <- optimizeALS(int.pbmc, k = 25, max.iters = 100, rand.seed = 87598, print.obj = T )
+```
+
+Stage III: Quantile Normalization and Joint Clustering (1 minute)
+
+9. Using the metagene factors calculated by iNMF, we then assign each cell to the factor on which it has the highest loading, giving joint clusters that correspond across datasets. We then perform quantile normalization by dataset, factor, and cluster to fully integrate the datasets. To perform this analysis, typing in:
+Important parameters of quantile_norm are as follows:
+
+knn_k. This sets the number of nearest neighbors for within-dataset KNN graph. The default is 20.
+quantiles. This sets the number of quantiles to use for quantile normalization. The default is 50.
+min_cells. This indicates the minimum number of cells to consider a cluster as shared across datasets. The default is 20.
+dims.use.. This sets the indices of factors to use for quantile normalization. The user can pass in a vector of indices indicating specific factors. This is helpful for excluding factors capturing biological signals such as the cell cycle or technical signals such as mitochondrial genes. The default is all k of the factors.
+do.center. This indicates whether to center the data when scaling factors. The default is FALSE. This option should be set to TRUE when metagene loadings have a mean above zero, as with dense data such as DNA methylation.
+max_sample. This sets the maximum number of cells used for quantile normalization of each cluster and factor. The default is 1000.
+refine.knn. This indicates whether to increase robustness of cluster assignments using KNN graph. The default is TRUE.
+eps. This sets the error bound of the nearest neighbor search. The default is 0.9. Lower values give more accurate nearest neighbor graphs but take much longer to computer.
+ref_dataset. This indicates the name of the dataset to be used as a reference for quantile normalization. By default, the dataset with the largest number of cells is used.
+
+```{r}
+int.pbmc <- quantile_norm(int.pbmc, knn_k = 30, min_cells = 30)
+```
+
+
+10. The quantile_norm function gives joint clusters that correspond across datasets, which are often completely satisfactory and sufficient for downstream analyses. However, if desired, after quantile normalization, users can additionally run the Louvain algorithm for community detection, which is widely used in single-cell analysis and excels at merging small clusters into broad cell classes. This can be achieved by running the louvainCluster function. Several tuning parameters, including resolution, k, and prune control the number of clusters produced by this function. For this dataset, we use a resolution of 0.2, which yields 16 clusters (see below).
+
+```{r}
+int.pbmc <- louvainCluster(int.pbmc, resolution = 0.6, random.seed = 78098, k = 30)
+saveRDS(int.pbmc, file="liger_integrated_pbmc_3k_atac_rna.rds")
+```
+
+Stage IV: Visualization (2 - 3 minutes) and Downstream Analysis (30 - 40 minutes)
+11. In order to visualize the clustering results, the user can use two dimensionality reduction methods supported by LIGER: t-SNE and UMAP. We find that often for datasets containing continuous variation such as cell differentiation, UMAP better preserves global relationships, whereas t-SNE works well for displaying discrete cell types, such as those in the brain. The UMAP algorithm (called by the runUMAP function) scales readily to large datasets. The runTSNE function also includes an option to use FFtSNE, a highly scalable implementation of t-SNE that can efficiently process huge datasets. 
+
+```{r}
+int.pbmc <- runUMAP(int.pbmc, distance = 'cosine', n_neighbors = 30, min_dist = 0.3, rand.seed = 980234)
+saveRDS(int.pbmc, file="liger_integrated_pbmc_3k_atac_rna.rds")
+```
+
+12. We can then visualize each cell, colored by cluster or dataset.
+
+```{r}
+plotByDatasetAndCluster(int.pbmc, axis.labels = c('UMAP 1', 'UMAP 2'))
+```
+13. LIGER employs the Wilcoxon rank-sum test to identify marker genes that are differentially expressed in each cell type using the following settings. We provide parameters that allow the user to select which datasets to use (data.use) and whether to compare across clusters or across datasets within each cluster (compare.method). To identify marker genes for each cluster combining scATAC and scRNA profiles, typing in:
+
+Important parameters of runWilcoxon are as follows:
+
+data.use. This selects which dataset (or set of datasets) to be included. The default is ‘all’ (using all the datasets).
+compare.method. This indicates whether to compare across clusters or across datasets with each cluster. Setting compare.method to ‘clusters’ compares each feature’s (genes, peaks, etc.) loading between clusters combining all datasets, which gives us the most specific features for each cluster. On the other hand, setting compare.method to ‘datasets’ gives us the most differentially loaded features for every cluster between datasets.
+
+```{r}
+int.pbmc.wilcoxon <- runWilcoxon(int.pbmc, data.use = 'all', compare.method = 'clusters')
+
+
+```
+
+14. The number of marker genes identified by runWilcoxon varies and depends on the datasets used. The function outputs a data frame that the user can then filter to select markers which are statistically and biologically significant. For example, one strategy is to filter the output by taking markers which have padj (Benjamini-Hochberg adjusted p-value) less than 0.05 and logFC (log fold change between observations in group versus out) larger than 3:
+
+
+```{r}
+int.pbmc.wilcoxon_filter <- int.pbmc.wilcoxon %>% filter( padj < 0.05 & logFC > 3.0)
+
+```
+
+
+15. You can then re-sort the markers by its padj value in ascending order and choose the top 20 for each cell type. For example, we can subset and re-sort the output for Cluster 1 and take the top 5 markers by typing these commands:
+
+```{r}
+int.pbmc.wilcoxon_markers <- int.pbmc.wilcoxon_filter %>% group_by(group) %>% arrange(padj, .by_group =T ) %>% top_n(n=5, wt = logFC)
+```
+
+16. Top 5 markers for joint ATAC + RNA clusters 
+
+```{r}
+int.pbmc.wilcoxon_markers %>% DT::datatable()
+
+```
+
+# Plot top 2 genes for all clusters
+```{r}
+int.pbmc.wilcoxon_markers_genes <- int.pbmc.wilcoxon_filter %>% group_by(group) %>% arrange(padj, .by_group =T ) %>% top_n(n=2, wt = logFC) %>% select(feature)
+```
+
+# Plot Genes on UMAP for RNA and ATAC
+
+```{r}
+pdf("marker_gene_plots_liger.pdf",width = 6, height = 4)
+ plotGenes(int.pbmc, genes = unique(int.pbmc.wilcoxon_markers_genes$feature),axis.labels = c('UMAP 1', 'UMAP 2'), zero.color = "#939393", scale.by="dataset")
+ dev.off()
+```
+```{r}
+BCL11B <- plotGene(int.pbmc, "BCL11B", axis.labels = c('UMAP 1', 'UMAP 2'), return.plots = TRUE, zero.color = "#939393")
+LEF1 <- plotGene(int.pbmc, "LEF1", axis.labels = c('UMAP 1', 'UMAP 2'), return.plots = TRUE, zero.color = "#939393")
+
+```
+
