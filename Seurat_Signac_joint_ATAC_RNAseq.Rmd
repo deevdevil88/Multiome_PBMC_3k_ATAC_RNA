@@ -1,0 +1,489 @@
+---
+title: "PBMC_granulocyte_sc_ATAC_RNA_Seurat_Signac"
+author: "Devika Agarwal"
+date: 'Last update: `r date()`'
+output:
+  html_notebook:
+    theme: cerulean
+    number_sections: true
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: yes
+      toc_depth: 6
+---
+---
+<style type="text/css">
+
+body{ /* Normal  */
+      font-size: 12px;
+  }
+td {  /* Table  */
+  font-size: 10px;
+}
+h1.title {
+  font-size: 20px;
+  color: DarkRed;
+}
+h1 { /* Header 1 */
+  font-size: 20px;
+  color: DarkBlue;
+}
+h2 { /* Header 2 */
+    font-size: 18px;
+  color: DarkBlue;
+}
+h3 { /* Header 3 */
+  font-size: 14px;
+  font-family: "Times New Roman", Times, serif;
+  color: DarkBlue;
+}
+code.r{ /* Code block */
+    font-size: 12px;
+}
+pre { /* Code block - determines code spacing between lines */
+    font-size: 14px;
+}
+</style>
+
+
+
+```{r}
+library(Signac)
+library(Seurat)
+library(EnsDb.Hsapiens.v86)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(tidyverse)
+library(patchwork)
+library(data.table)
+library(doMC)
+
+knitr::opts_chunk$set(cache=F,echo=T,message=FALSE,warning=FALSE, cache.lazy = FALSE)
+## white background theme for all
+theme_set(theme_bw())
+set.seed(76034)
+```
+
+# Load RNA and ATAC data 
+
+```{r}
+# load the RNA and ATAC data
+counts <- Read10X_h5("./pbmc_granulocyte_sorted_3k_filtered_feature_bc_matrix.h5")
+fragpath <- "./pbmc_granulocyte_sorted_3k_atac_fragments.tsv.gz"
+
+```
+
+# Get gene annotations and create seurat object for RNA and ATAC assay
+
+```{r}
+# get gene annotations for hg38
+annotation <- GetGRangesFromEnsDb(ensdb = EnsDb.Hsapiens.v86)
+seqlevelsStyle(annotation) <- "UCSC"
+genome(annotation) <- "hg38"
+
+
+
+
+# create a Seurat object containing the RNA adata
+pbmc <- CreateSeuratObject(
+  counts = counts$`Gene Expression`,
+  assay = "RNA"
+)
+pbmc[["percent.mt"]] <- PercentageFeatureSet(pbmc, pattern = "^MT-")
+
+# create ATAC assay and add it to the object
+pbmc[["ATAC"]] <- CreateChromatinAssay(
+  counts = counts$Peaks,
+  sep = c(":", "-"),
+  fragments = fragpath,
+  annotation = annotation,
+  min.cells = 10
+)
+```
+
+
+```{r}
+pbmc
+pbmc[['ATAC']]
+```
+
+
+# Quality Control 
+
+We can compute per-cell quality control metrics using the DNA accessibility data and remove cells that are outliers for these metrics, as well as cells with low or unusually high counts for either the RNA or ATAC assay.
+
+```{r}
+DefaultAssay(pbmc) <- "ATAC"
+
+pbmc <- NucleosomeSignal(pbmc)
+pbmc <- TSSEnrichment(pbmc, fast=FALSE)
+
+
+```
+
+We can inspect the TSS enrichment scores by grouping the cells based on the score and plotting the accessibility signal over all TSS sites. Setting the fast=TRUE option in TSSEnrichment() will only compute the TSS enrichment score without storing the entire cell by position matrix of Tn5 insertion frequency for each cell, and can save memory. However, setting fast=TRUE will not allow downstream plotting of the TSS enrichment signal for different groups of cells using the TSSPlot() function, shown here:
+
+```{r}
+pbmc$high.tss <- ifelse(pbmc$TSS.enrichment > 1.5, 'High', 'Low')
+TSSPlot(pbmc, group.by = 'high.tss') + NoLegend()
+```
+We can also look at the fragment length periodicity for all the cells, and group by cells with high or low nucleosomal signal strength. You can see that cells that are outliers for the mononucleosomal / nucleosome-free ratio (based on the plots above) have different nucleosomal banding patterns. The remaining cells exhibit a pattern that is typical for a successful ATAC-seq experiment.
+
+Typical fragment size distribution plot shows enrichment around 100 and 200 bp, indicating nucleosome-free and mono-nucleosome-bound fragments.
+
+```{r}
+pbmc$nucleosome_group <- ifelse(pbmc$nucleosome_signal > 2.0, 'NS > 2.0', 'NS < 2.0')
+FragmentHistogram(object = pbmc, group.by = 'nucleosome_group')
+```
+
++ TSS enrichment scores grouped by high or low nucelosomal signal strength
+
++ Typical TSS enrichment plot shows that nucleosome-free fragments are enriched at TSS, while mono-nucleosome fragments are depleted at TSS but enriched at flanking regions.
+
+```{r}
+TSSPlot(pbmc, group.by = 'nucleosome_group') + NoLegend()
+```
+```{r}
+# add blacklist ratio and fraction of reads in peaks
+#pbmc$pct_reads_in_peaks <- pbmc$peak_region_fragments / pbmc$passed_filters * 100
+#pbmc$blacklist_ratio <- pbmc$blacklist_region_fragments / pbmc$peak_region_fragments
+```
+
+# Counting fragments in genome blacklist regions
+
+The ratio of reads in genomic blacklist regions, that are known to artifactually accumulate reads in genome sequencing assays, can be diagnostic of low-quality cells. We provide blacklist region coordinates for several genomes (hg19, hg38, mm9, mm10, ce10, ce11, dm3, dm6) in the Signac package for convenience. These regions were provided by the ENCODE consortium, and we encourage users to cite their paper if you use the regions in your analysis. The FractionCountsInRegion() function can be used to calculate the fraction of all counts within a given set of regions per cell. We can use this function and the blacklist regions to find the fraction of blacklist counts per cell.
+
+
+
+
+```{r}
+# not run
+pbmc$blacklist_fraction <- FractionCountsInRegion(
+  object = pbmc, 
+  assay = 'ATAC',
+  regions = blacklist_hg19
+)
+```
+
+
+
+
+
+
+```{r,fig.width=8, fig.height=8}
+VlnPlot(
+  object = pbmc,
+  features = c("nCount_RNA", "nCount_ATAC", "TSS.enrichment", "nucleosome_signal","percent.mt", "blacklist_fraction"),
+  ncol = 3,
+  pt.size = 0.02,
+  log=F
+) 
+```
++ Filter out low quality cells
+
+```{r}
+# filter out low quality cells
+pbmc <- subset(
+  x = pbmc,
+  subset = nCount_ATAC < 50000 &
+    nCount_RNA < 12000 &
+    nCount_ATAC > 500 &
+    nCount_RNA > 500 &
+    nucleosome_signal < 1.5 &
+    TSS.enrichment > 1 &
+    percent.mt <20 &
+    blacklist_fraction < 0.05
+)
+pbmc
+```
+
+# Peak calling
+
+The set of peaks identified using Cellranger often merges distinct peaks that are close together. This can create a problem for certain analyses, particularly motif enrichment analysis and peak-to-gene linkage. To identify a more accurate set of peaks, we can call peaks using MACS2 with the CallPeaks() function. Here we call peaks on all cells together, but we could identify peaks for each group of cells separately by setting the group.by parameter, and this can help identify peaks specific to rare cell populations.
+
+
+```{r}
+# call peaks using MACS2
+peaks <- CallPeaks(pbmc, macs2.path = "/Users/devikaagarwal/tools/2021_conda/envs/peaktools_env/bin/macs2")
+```
+
+```{r}
+# remove peaks on nonstandard chromosomes and in genomic blacklist regions
+peaks <- keepStandardChromosomes(peaks, pruning.mode = "coarse")
+peaks <- subsetByOverlaps(x = peaks, ranges = blacklist_hg38_unified, invert = TRUE)
+
+# quantify counts in each peak
+macs2_counts <- FeatureMatrix(
+  fragments = Fragments(pbmc),
+  features = peaks,
+  cells = colnames(pbmc)
+)
+```
+
+
+```{r}
+# create a new assay using the MACS2 peak set and add it to the Seurat object
+pbmc[["peaks"]] <- CreateChromatinAssay(
+  counts = macs2_counts,
+  fragments = fragpath,
+  annotation = annotation
+)
+```
+
+
+
+
+
+
+```{r}
+saveRDS(pbmc, file="signac_seurat_pbmc_3k.rds")
+```
+
+
+# Gene expression data processing
+
+We can normalize the gene expression data using SCTransform, and reduce the dimensionality using PCA.
+
+```{r}
+DefaultAssay(pbmc) <- "RNA"
+pbmc <- SCTransform(pbmc)
+pbmc <- RunPCA(pbmc)
+DefaultAssay(pbmc) <- "SCT"
+pbmc <- RunUMAP(pbmc, dims = 1:30,reduction.name = "umap.rna", reduction.key = "rnaUMAP_")
+```
+
+
+# DNA accessibility data processing
+Here we process the DNA accessibility assay the same way we would process a scATAC-seq dataset, by performing latent semantic indexing (LSI).
+
+
+```{r}
+DefaultAssay(pbmc) <- "peaks"
+pbmc <- FindTopFeatures(pbmc, min.cutoff = 15)
+pbmc <- RunTFIDF(pbmc)
+pbmc <- RunSVD(pbmc)
+```
+
+The first LSI component often captures sequencing depth (technical variation) rather than biological variation. If this is the case, the component should be removed from downstream analysis. We can assess the correlation between each LSI component and sequencing depth using the DepthCor() function:
+
+```{r}
+DepthCor(pbmc)
+```
+
+
+```{r}
+pbmc <- RunUMAP(pbmc, reduction = "lsi", dims = 2:50, reduction.name = "umap.peaks", reduction.key = "peaksUMAP_")
+```
+
+Now we plot the results from both modalities. Cells have been previously annotated based on transcriptomic state. We will predict annotations for the scATAC-seq cells.
+
+```{r}
+p1 <- DimPlot(pbmc, label = FALSE, reduction = "umap.rna") + NoLegend() + ggtitle("RNA")
+p2 <- DimPlot(pbmc, label = FALSE, reduction = "umap.peaks") + NoLegend() + ggtitle("PEAKS")
+p1 + p2
+```
+```{r}
+saveRDS(pbmc, file="signac_seurat_pbmc_3k.rds")
+```
+
+A WNN graph for  for Joint ATAC + RNAseq visualization and clustering 
+
+```{r}
+pbmc <- FindMultiModalNeighbors(pbmc, reduction.list = list("pca", "lsi"), dims.list = list(1:50, 2:40))
+pbmc <- RunUMAP(pbmc, nn.name = "weighted.nn", reduction.name = "wnn.umap", reduction.key = "wnnUMAP_")
+pbmc <- FindClusters(pbmc, graph.name = "wsnn", algorithm = 3, verbose = FALSE)
+```
+
+```{r}
+DimPlot(pbmc, reduction = "wnn.umap", label = T, label.size = 2.5, repel = TRUE) + ggtitle("WNN")
+```
+
+Annotate cell types using multi-modal PBMC reference dataset
+
++ We load the reference (download here) from our recent preprint, and visualize the pre-computed UMAP. This reference is stored as an h5Seurat file, a format that enables on-disk storage of multimodal Seurat objects (more details on h5Seurat and
+
+```{r}
+
+library(SeuratDisk)
+
+# load PBMC reference
+reference <- LoadH5Seurat("./pbmc_multimodal.h5seurat")
+
+```
+
+
+```{r, fig.width=10}
+p1<- DimPlot(object = reference, reduction = "wnn.umap", group.by = "celltype.l1", label = TRUE, label.size = 3, repel = TRUE) + NoLegend()
+p2<- DimPlot(object = reference, reduction = "wnn.umap", group.by = "celltype.l2", label = TRUE, label.size = 3, repel = TRUE) + NoLegend()
+p1 + p2
+
+```
+
+```{r}
+
+DefaultAssay(pbmc) <- "RNA"
+
+# transfer cell type labels from reference to query
+transfer_anchors <- FindTransferAnchors(
+  reference = reference,
+  query = pbmc,
+  normalization.method = "LogNormalize",
+  reference.reduction = "spca",
+  recompute.residuals = FALSE,
+  dims = 1:50
+)
+
+predictions <- TransferData(
+  anchorset = transfer_anchors,
+  reference = reference,
+  refdata = list( 
+    celltype.l1 = "celltype.l1",
+    celltype.l2 = "celltype.l2",
+    predicted_ADT = "ADT"),
+  weight.reduction = pbmc[['pca']],
+  dims = 1:50
+)
+```
+
+Annotated celltype visualisation
+
+Celltype L1
+
+```{r}
+pbmc <- AddMetaData(
+  object = pbmc,
+  metadata = predictions$celltype.l1
+)
+
+# set the cell identities to the cell type predictions
+Idents(pbmc) <- "predicted.id"
+
+```
+
+Celltype L1
+
+```{r, fig.width= 12, fig.height= 6}
+p1 <- DimPlot(pbmc, reduction = "umap.rna", group.by = "predicted.id", label = TRUE, label.size = 3.0, repel = TRUE) + ggtitle("RNA")
+p2 <- DimPlot(pbmc, reduction = "umap.peaks", group.by = "predicted.id", label = TRUE, label.size = 3.0, repel = TRUE) + ggtitle("ATAC")
+p3 <- DimPlot(pbmc, reduction = "wnn.umap", group.by = "predicted.id", label = TRUE, label.size = 3.0, repel = TRUE) + ggtitle("WNN")
+p1 + p2 + p3 & NoLegend() & theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+
+
+```{r}
+pbmc <- AddMetaData(
+  object = pbmc,
+  metadata = predictions$celltype.l2
+)
+
+# set the cell identities to the cell type predictions
+Idents(pbmc) <- "predicted.id"
+
+# set a reasonable order for cell types to be displayed when plotting
+levels(pbmc) <- c("CD4 Naive", "CD4 TCM", "CD4 CTL", "CD4 TEM", "CD4 Proliferating",
+                  "CD8 Naive", "dnT",
+                 "CD8 TEM", "CD8 TCM", "CD8 Proliferating", "MAIT", "NK", "NK_CD56bright",
+                 "NK Proliferating", "gdT",
+                 "Treg", "B naive", "B intermediate", "B memory", "Plasmablast",
+                 "CD14 Mono", "CD16 Mono",
+                 "cDC1", "cDC2", "pDC", "HSPC", "Eryth", "ASDC", "ILC", "Platelet")
+```
+
+
+
+Celltype L2
+
+```{r, fig.width= 12, fig.height= 6}
+p1 <- DimPlot(pbmc, reduction = "umap.rna", group.by = "predicted.id", label = TRUE, label.size = 3.0, repel = TRUE) + ggtitle("RNA")
+p2 <- DimPlot(pbmc, reduction = "umap.peaks", group.by = "predicted.id", label = TRUE, label.size = 3.0, repel = TRUE) + ggtitle("ATAC")
+p3 <- DimPlot(pbmc, reduction = "wnn.umap", group.by = "predicted.id", label = TRUE, label.size = 3.0, repel = TRUE) + ggtitle("WNN")
+p1 + p2 + p3 & NoLegend() & theme(plot.title = element_text(hjust = 0.5))
+
+```
+Linking peaks to genes
+For each gene, we can find the set of peaks that may regulate the gene by by computing the correlation between gene expression and accessibility at nearby peaks, and correcting for bias due to GC content, overall accessibility, and peak size. See the Signac paper for a full description of the method we use to link peaks to genes.
+
+Running this step on the whole genome can be time consuming, so here we demonstrate peak-gene links for a subset of genes as an example. The same function can be used to find links for all genes by omitting the genes.use parameter:
+
+```{r}
+DefaultAssay(pbmc) <- "peaks"
+
+# first compute the GC content for each peak
+pbmc <- RegionStats(pbmc, genome = BSgenome.Hsapiens.UCSC.hg38)
+
+# link peaks to genes
+pbmc <- LinkPeaks(
+  object = pbmc,
+  peak.assay = "peaks",
+  expression.assay = "SCT",
+  genes.use = c('CD8A','CD4','CD8B')
+)
+```
+
+
+
+
+
+For example, the ATAC-seq data assists in the separation of CD4 and CD8 T cell states. This is due to the presence of multiple loci that exhibit differential accessibility between different T cell subtypes. For example, we can visualize ‘pseudobulk’ tracks of the CD8A and CD4 locus alongside violin plots of gene expression levels, using tools in the Signac visualization vignette.
+
+```{r, fig.width =12}
+## to make the visualization easier, subset T cell clusters
+celltype.names <- levels(pbmc)
+tcell.names <- grep("CD4|CD8|Treg", celltype.names,value = TRUE)
+tcells <- subset(pbmc, idents = tcell.names)
+CoveragePlot(object = pbmc, region = c('CD8A','CD4'), features = c('CD8A','CD4'), assay = 'peaks', expression.assay = 'SCT', peaks = T,
+            extend.upstream = 10000, extend.downstream = 10000, links = T, idents = tcell.names)
+```
+
+# Calling celltype  specific peaks
+
++ To call peaks on each annotated cell type, we can use the group.by argument:
++ predicted.id : celltype L2
+
+
+```{r}
+DefaultAssay(pbmc) <- "ATAC"
+peaks_celltypel2 <- CallPeaks(pbmc, macs2.path = "/Users/devikaagarwal/tools/2021_conda/envs/peaktools_env/bin/macs2", group.by = "predicted.id")
+```
+
+Coverage plot comparing CD4 and CD8 locus peaks and expression, with celltype specific peaks
+
+
+```{r,fig.width =12, fig.height= 8}
+## to make the visualization easier, subset T cell clusters
+celltype.names <- levels(pbmc)
+tcell.names <- grep("CD4|CD8|Treg", celltype.names,value = TRUE)
+tcells <- subset(pbmc, idents = tcell.names)
+CoveragePlot(object = pbmc, region = c('CD8A','CD4'), features = c('CD8A','CD4'), assay = 'peaks', expression.assay = 'SCT', peaks = T,
+            extend.upstream = 500, extend.downstream = 10000, links = T, idents = tcell.names, ranges = peaks_celltypel2, ranges.title = "celltype")
+```
+
+```{r}
+saveRDS(pbmc, file="./signac_seurat_pbmc_3k.rds")
+```
+
+
+```{r}
+saveRDS(peaks_celltypel2, file="./signac_seurat_macs2_celltype_peaks_pbmc_3k.rds")
+```
+
+```{r}
+pbmc <- readRDS(file = "./signac_seurat_pbmc_3k.rds")
+```
+
+# Modality specific celltype weights
+
+```{r}
+
+p1 <- VlnPlot(pbmc, features = "SCT.weight", group.by = 'predicted.id', sort = TRUE, pt.size = 0.05) +
+  NoLegend() + ggtitle("RNA modality weights")
+```
+```{r, fig.height=5, fig.width=6}
+
+p2 <- VlnPlot(pbmc, features = "peaks.weight", group.by = 'predicted.id', sort = TRUE, pt.size = 0.05) +
+  NoLegend() + ggtitle("MACS2 peaks weights")
+
+p1 + p2
+```
